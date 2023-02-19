@@ -1,0 +1,47 @@
+trigger: none
+
+variables:
+  imageName: ab7580/webgoat
+  imageTag: latest
+  containerName: WebGoatContainer
+  applicationPort: 8080
+  dockerPort: 8080
+  environmentTags: Ubuntu
+  dockerHubServiceConn: DockerHubServiceConn
+
+stages:
+      
+  - template: 'templates/static_build.yaml'
+    parameters:
+      imageName: ${{ variables.imageName }}
+      imageTag: ${{ variables.imageTag }}
+      dockerHubServiceConn: ${{ variables.dockerHubServiceConn }}
+      mavenPomFile: 'pom.xml'
+      sonarQubeRun: true
+      sonarQubeBreak: true
+      dockerFilePath: 'webgoat-server/Dockerfile'
+
+  - template: 'templates/zap.yaml'
+    parameters:
+      environmentName: test
+      environmentTags: ${{ variables.environmentTags }}
+      dockerHubServiceConn: ${{ variables.dockerHubServiceConn }}
+      containerName: ${{ variables.containerName }}
+      imageName: ${{ variables.imageName }}
+      imageTag: ${{ variables.imageTag }}
+      applicationPort: ${{ variables.applicationPort }}
+      dockerPort: ${{ variables.dockerPort }}
+      relativeUrlToScan: WebGoat
+      shouldZAPBreakPipeline: true
+
+  - ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/master') }}:
+    - template: 'templates/deploy.yaml'
+      parameters:
+        environmentName: prod
+        environmentTags: ${{ variables.environmentTags }}
+        containerName: ${{ variables.containerName }}
+        imageName: ${{ variables.imageName }}
+        imageTag: ${{ variables.imageTag }}
+        dockerHubServiceConn: ${{ variables.DockerHubServiceConn }}
+        applicationPort: ${{ variables.applicationPort }}
+        dockerPort: ${{ variables.dockerPort }}

@@ -1,0 +1,11 @@
+trigger: none
+
+variables:
+  dependencyCheckCache: false
+  dependencyCheckBreak: false
+
+stages:
+  - template: 'templates/dependency_check.yaml'
+    parameters:
+      dependencyCheckCache: ${{ variables.dependencyCheckCache }}
+      dependencyCheckBreak: ${{ variables.dependencyCheckBreak }}

@@ -1,0 +1,54 @@
+parameters:
+- name: dependencyCheckCache
+  type: boolean
+- name: dependencyCheckBreak
+  type: boolean
+ 
+stages:
+  - stage: DependencyCheck
+    jobs:
+    - job: DependencyCheck
+      pool:
+        vmImage: 'ubuntu-latest'
+      displayName: DependencyCheck
+      workspace:
+        clean: all
+      steps:
+      - task: Cache@2
+        condition: and(succeeded(), ${{ parameters.dependencyCheckCache }})
+        displayName: Cache DependencyCheckData
+        inputs:
+            key: '"depcheckdata" | "$(Agent.OS)"'
+            path: dependency-check-data
+
+      - task: Bash@3
+        displayName: Download DependencyCheck
+        inputs:
+            targetType: 'inline'
+            script: |
+                wget "https://github.com/jeremylong/DependencyCheck/releases/download/v7.1.2/dependency-check-7.1.2-release.zip"
+                unzip dependency-check-7.1.2-release.zip
+                
+      - task: Bash@3
+        displayName: Run DependencyCheck
+        inputs:
+            targetType: 'inline'
+            script: |
+                # https://jeremylong.github.io/DependencyCheck/dependency-check-cli/arguments.html
+                ./dependency-check/bin/dependency-check.sh --scan . --enableExperimental --format HTML --format JSON --prettyPrint --data ./dependency-check-data
+            
+      - task: PowerShell@2
+        displayName: DependencyCheck Break
+        condition: and(succeeded(), ${{ parameters.dependencyCheckBreak}})
+        inputs:
+          filePath: 'devops/dependencycheck_fail_pipeline.ps1'
+
+      - task: CopyFiles@2
+        inputs:
+            Contents: '**dependency-check-report.html'
+            TargetFolder: '$(Build.ArtifactStagingDirectory)'
+
+      - task: PublishBuildArtifacts@1
+        inputs:
+            PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+            ArtifactName: 'dependency-check'

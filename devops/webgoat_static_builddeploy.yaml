@@ -1,0 +1,87 @@
+trigger: none 
+
+variables:
+  imageName: 'ab7580/webgoat'
+  # imageTag: $(Build.BuildId)
+  imageTag: latest
+  containerName: WebGoatContainer
+
+stages:
+  - stage: Build
+    jobs:
+    - job: Build
+      pool:
+        vmImage: 'ubuntu-latest'
+      displayName: Build WebGoat
+      workspace:
+        clean: all
+      steps:
+      - task: SonarQubePrepare@5
+        displayName: SonarQube Prepare
+        inputs:
+          SonarQube: 'SonarCubeServiceConn'
+          scannerMode: 'Other'
+      - task: Maven@3
+        displayName: Maven Build
+        inputs:
+          mavenPomFile: 'pom.xml'
+          goals: 'clean install'
+          publishJUnitResults: false
+          javaHomeOption: 'JDKVersion'
+          jdkVersionOption: '1.11'
+          mavenVersionOption: 'Default'
+          mavenAuthenticateFeed: false
+          effectivePomSkip: false
+          sonarQubeRunAnalysis: true
+          sqMavenPluginVersionChoice: 'latest'
+      - task: SonarQubePublish@5
+        displayName: SonarQube Publish
+        inputs:
+          pollingTimeoutSec: '300'
+      - task: sonar-buildbreaker@8
+        displayName: SonarQube Break (on Fail)
+        inputs:
+          SonarQube: 'SonarCubeServiceConn'
+      - task: PowerShell@2
+        displayName: SonarQube Break (on Pipeline Configuration)
+        inputs:
+          filePath: 'devops/sonarcube_fail_pipeline.ps1'
+        env:
+          SONAR-TOKEN: $(sonar-token) # secret defined in pipeline must be mapped to env variable and used in powershell script
+      - task: Docker@2
+        displayName: Build Docker Image
+        inputs:
+          repository: '$(imageName)'
+          command: 'build'
+          Dockerfile: 'webgoat-server/Dockerfile'
+          tags: '$(imageTag)'
+      - task: Docker@2
+        displayName: Push Docker Image
+        inputs:
+          containerRegistry: 'DockerHubServiceConn'
+          repository: '$(imageName)'
+          command: 'push'
+          tags: '$(imageTag)'
+
+  - stage: DeployProd
+    jobs:
+    - deployment: DeployProduction
+      environment:
+        name: prod
+        tags: Ubuntu
+        resourceType: VirtualMachine
+      workspace:
+        clean: all
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - task: Bash@3
+              displayName: Run WebGoat
+              inputs:
+                targetType: 'inline'
+                script: |
+                  docker container stop $(containerName)
+                  docker container rm $(containerName)
+                  docker image rm $(imageName)
+                  docker run -d --name $(containerName) -p 8080:8080 $(imageName):$(imageTag)

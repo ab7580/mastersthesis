@@ -1,0 +1,121 @@
+parameters:
+- name: 'imageName'
+  type: string
+- name: 'imageTag'
+  type: string
+- name: 'mavenPomFile'
+  type: string
+- name: 'sonarQubeRun'
+  type: boolean
+  default: false
+- name: 'sonarQubeBreak'
+  type: boolean
+  default: false
+- name: dockerHubServiceConn # name of the defined service connection to DockerHub. Must be defined on the Project Settings
+  type: string
+- name: dockerFilePath
+  type: string
+
+# sonarQube free tier does not have free analysis on non master branch, so to not break builds we use this condition for all sq related tasks
+# eq(variables['Build.SourceBranch'], 'refs/heads/master')
+
+stages:
+  - stage: Build
+    jobs:
+    - job: Build
+      pool:
+        vmImage: 'ubuntu-latest'
+      displayName: Build
+      workspace:
+        clean: all
+      steps:
+# SONARQUBE + BUILD START
+      - task: SonarQubePrepare@5
+        displayName: SonarQube Prepare
+        condition: and(${{ parameters.sonarQubeRun }}, eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+        inputs:
+          SonarQube: 'SonarCubeServiceConn'
+          scannerMode: 'Other'
+          extraProperties: sonar.exclusions=devops/**
+
+      # this one will execute if sonarQubeRun = true and branch = master
+      - task: Maven@3
+        displayName: Maven Build
+        condition: and(${{ parameters.sonarQubeRun }}, eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+        inputs:
+          mavenPomFile: ${{ parameters.mavenPomFile }}
+          goals: 'clean install'
+          publishJUnitResults: false
+          javaHomeOption: 'JDKVersion'
+          jdkVersionOption: '1.11'
+          mavenVersionOption: 'Default'
+          mavenAuthenticateFeed: false
+          effectivePomSkip: false
+          sonarQubeRunAnalysis: true # <--- set this to true in this case
+          sqMavenPluginVersionChoice: 'latest'
+      # this one will execute if any of the above 2 conditions are false
+      - task: Maven@3
+        displayName: Maven Build
+        condition: or(eq(${{ parameters.sonarQubeRun }}, false), ne(variables['Build.SourceBranch'], 'refs/heads/master'))
+        inputs:
+          mavenPomFile: ${{ parameters.mavenPomFile }}
+          goals: 'clean install'
+          publishJUnitResults: false
+          javaHomeOption: 'JDKVersion'
+          jdkVersionOption: '1.11'
+          mavenVersionOption: 'Default'
+          mavenAuthenticateFeed: false
+          effectivePomSkip: false
+          sonarQubeRunAnalysis: false # <--- set this to false in this case
+          sqMavenPluginVersionChoice: 'latest'
+
+      - task: SonarQubePublish@5
+        displayName: SonarQube Publish
+        condition: and(${{ parameters.sonarQubeRun }}, eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+        inputs:
+          pollingTimeoutSec: '300'
+
+      - task: sonar-buildbreaker@8
+        displayName: SonarQube Break (on Quality Gate Fail)
+        condition: and(and( ${{ parameters.sonarQubeRun}}, ${{ parameters.sonarQubeBreak}}), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+        inputs:
+          SonarQube: 'SonarCubeServiceConn'
+
+      - task: PowerShell@2
+        displayName: SonarQube Break
+        condition: and(and( ${{ parameters.sonarQubeRun}}, ${{ parameters.sonarQubeBreak}}), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+        inputs:
+          filePath: 'devops/sonarcube_fail_pipeline.ps1'
+        env:
+          SONAR-TOKEN: $(sonar-token) # secret defined in pipeline must be mapped to env variable and used in powershell script
+# SONARQUBE + BUILD END
+
+# DOCKER START
+      - task: Docker@2
+        displayName: Docker Login
+        inputs:
+          containerRegistry: ${{ parameters.dockerHubServiceConn }}
+          command: 'login'
+
+      - task: Docker@2
+        displayName: Build Docker Image
+        inputs:
+          repository: '${{ parameters.imageName }}'
+          command: 'build'
+          Dockerfile: '${{ parameters.dockerFilePath }}'
+          tags: '${{ parameters.imageTag }}'
+          
+      - task: Docker@2
+        displayName: Push Docker Image
+        inputs:
+          containerRegistry: 'DockerHubServiceConn'
+          repository: '${{ parameters.imageName }}'
+          command: 'push'
+          tags: '${{ parameters.imageTag }}'
+        
+      - task: Docker@2
+        displayName: Docker Logout
+        inputs:
+          containerRegistry: ${{ parameters.dockerHubServiceConn }}
+          command: 'logout'
+# DOCKER END

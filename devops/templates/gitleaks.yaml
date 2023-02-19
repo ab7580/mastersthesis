@@ -1,0 +1,16 @@
+parameters:
+- name: gitLeaksBreak
+  type: boolean
+
+stages:
+- stage: Gitleaks
+  jobs:
+  - job: Gitleaks
+    steps:
+    - task: Gitleaks@2
+      inputs:
+        scanlocation: '$(Build.SourcesDirectory)'
+        configtype: 'default'
+        scanmode: 'nogit'
+        taskfail: '${{ parameters.gitLeaksBreak }}'
+        reportformat: 'csv'

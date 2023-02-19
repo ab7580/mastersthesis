@@ -1,0 +1,207 @@
+# requires testing application to be available on DockerHub
+# requires deploy machine to be linux (created and used on ubuntu-20.04.4-desktop-amd64)
+
+parameters:
+- name: environmentName # name of the pipeline environment
+  type: string
+- name: environmentTags # tag as defined on the machine in the environment where testing will be executed
+  type: string
+- name: dockerHubServiceConn # name of the defined service connection to DockerHub. Must be defined on the Project Settings
+  type: string
+- name: containerName # name of the docker container which will be run
+  type: string
+- name: imageName # name of the image to pull from DockerHub
+  type: string
+- name: imageTag # tag of the image to pull from DockerHub
+  type: string
+- name: applicationPort # port on the machine where application will run
+  type: number
+- name: dockerPort # this port of the application inside docker will be mapped to applicationPort
+  type: number
+- name: relativeUrlToScan # where ZAP scanner will start
+  type: string
+- name: shouldZAPBreakPipeline # requires specific pipeline variables
+  type: boolean
+ 
+stages:
+- stage: ZAP
+  jobs:
+  - deployment: DynamicTesting
+    environment:
+      name: ${{ parameters.environmentName }}
+      tags: ${{ parameters.environmentTags }}
+      resourceType: VirtualMachine
+    workspace:
+      clean: all
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: none # we do not need any artifacts
+          - task: Docker@2
+            displayName: Docker Login
+            inputs:
+              containerRegistry: ${{ parameters.dockerHubServiceConn }}
+              command: 'login'
+          - task: Bash@3
+            displayName: Run Application for ZAP Testing
+            inputs:
+              targetType: 'inline'
+              script: |
+                # docker network is needed for ZAP container to access app container
+                docker network create zapnet
+                docker container stop ${{ parameters.containerName }}
+                docker container rm ${{ parameters.containerName }}
+                docker image rm ${{ parameters.imageName }}
+                docker run --net zapnet -d --name ${{ parameters.containerName }} -p ${{ parameters.applicationPort }}:${{ parameters.dockerPort }} ${{ parameters.imageName }}:${{ parameters.imageTag }}
+          - task: Docker@2
+            displayName: Docker Logout
+            inputs:
+              containerRegistry: ${{ parameters.dockerHubServiceConn }}
+              command: 'logout'
+          - task: Bash@3
+            displayName: ZAP Full Scan
+            inputs:
+              targetType: 'inline'
+              script: |
+                for i in {1..10} 
+                do 
+                    # first we must acquire the IP for Application running inside zapnet docker network
+                    zapIp=$(docker inspect ${{ parameters.containerName }} | jq -r ".[0].NetworkSettings.Networks.zapnet.IPAddress")
+                    [[ $zapIp == *"."* ]] && break || sleep 1 # if we have . in string -> we got IP
+                done
+                echo "sleeping"
+                sleep 10 # we wait for app to start or else zap scan will fail. this is enough time.
+                echo "finished sleeping"
+                docker run --net zapnet \
+                    -v $(Pipeline.Workspace):/zap/wrk/:rw \
+                    -t owasp/zap2docker-stable:2.11.1 zap-full-scan.py -d -I -j -m 10 -T 60 -t http://"$zapIp":${{ parameters.applicationPort }}/${{ parameters.relativeUrlToScan }} \
+                    -J report.json -r report.html
+  
+          - task: Bash@3
+            displayName: ZAP Break
+            condition: and(succeeded(), ${{ parameters.shouldZAPBreakPipeline }})
+            inputs:
+              targetType: 'inline'
+              script: |
+                lvl1Risks=0
+                lvl2Risks=0
+                lvl3Risks=0
+                lvl4Risks=0
+                for row in $(jq '.site[] | select(.alerts | length > 0) | .alerts[]' $(Pipeline.Workspace)/report.json | jq -r .riskcode); do
+                  case $row in
+                    0)
+                      ;;
+                    1)
+                      ((lvl1Risks++))
+                      ;;
+                    2)
+                      ((lvl2Risks++))
+                      ;;
+                    3)
+                      ((lvl3Risks++))
+                      ;;
+                    4)
+                      ((lvl4Risks++))
+                      ;;
+                    *)
+                      echo "ERROR IN SCRIPT - UNEXPECTED VALUE"
+                      echo $row
+                      ;;
+                  esac
+                done
+                echo "Lvl1 risks found:"
+                echo $lvl1Risks
+                echo "Lvl2 risks found:"
+                echo $lvl2Risks
+                echo "Lvl3 risks found:"
+                echo $lvl3Risks
+                echo "Lvl4 risks found:"
+                echo $lvl4Risks
+                if ((lvl1Risks > $(MAX-LVL1-RISK-ALLOWED))); then
+                    echo "Exceeded maximum allowed level 1 risk from ZAP report"
+                    exit 1
+                fi
+                if ((lvl2Risks > $(MAX-LVL2-RISK-ALLOWED))); then
+                    echo "Exceeded maximum allowed level 2 risk from ZAP report"
+                    exit 1
+                fi
+                if ((lvl3Risks > $(MAX-LVL3-RISK-ALLOWED))); then
+                    echo "Exceeded maximum allowed level 3 risk from ZAP report"
+                    exit 1
+                fi
+                if ((lvl4Risks > $(MAX-LVL4-RISK-ALLOWED))); then
+                    echo "Exceeded maximum allowed level 4 risk from ZAP report"
+                    exit 1
+                fi
+                echo "PASSED"
+          - task: CopyFiles@2
+            displayName: Copy ZAP Results
+            inputs:
+              SourceFolder: '$(Pipeline.Workspace)'
+              TargetFolder: '$(Build.ArtifactStagingDirectory)'
+
+          - task: PublishBuildArtifacts@1
+            displayName: Publish ZAP Results
+            inputs:
+              ArtifactName: 'owasp_zap_reports'    
+
+          - bash: |
+              cat <<EOF > $(Pipeline.Workspace)/nunit-template.hbs
+
+              <test-run
+                  id="2"
+                  name="Owasp test"
+                  start-time="{{@generated}}">
+                  {{#each site}}<test-suite
+                      id="{{@index}}"
+                      type="Assembly"
+                      name="{{[@name]}}"
+                      result="Failed"
+                      failed="{{alerts.length}}">
+                      <attachments>
+                          <attachment>
+                              <filePath>$(Pipeline.Workspace)/report.html</filePath>
+                          </attachment>
+                      </attachments>
+                      {{#each alerts}}<test-case
+                          id="{{@index}}"
+                          name="{{alert}}"
+                          result="Failed"
+                          fullname="{{alert}}"
+                          time="1">
+                          <failure>
+                              <message>
+                                  <![CDATA[{{{desc}}}]]>
+                              </message>
+                              <stack-trace>
+                                  <![CDATA[
+              Solution:
+              {{{solution}}}
+
+              Reference:
+              {{{reference}}}
+
+              instances:{{#each instances}}
+              * {{uri}}
+                  - {{method}}
+                  {{#if evidence}}- {{{evidence}}}{{/if}}
+                                  {{/each}}]]>
+                              </stack-trace>
+                          </failure>
+                      </test-case>
+                      {{/each}}
+                  </test-suite>
+                  {{/each}}
+              </test-run>
+              EOF
+            displayName: 'Create NUnit Template'
+          
+          - bash: 'handlebars $(Pipeline.Workspace)/report.json < $(Pipeline.Workspace)/nunit-template.hbs > $(Pipeline.Workspace)/test-results.xml'
+            displayName: 'Generate NUnit results'
+
+          - task: PublishTestResults@2
+            displayName: 'Publish NUnit Test Results'
+            inputs:
+              testResultsFormat: NUnit
+              testResultsFiles: '$(Pipeline.Workspace)/test-results.xml'

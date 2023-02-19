@@ -1,0 +1,54 @@
+parameters:
+- name: environmentName # name of the pipeline environment
+  type: string
+- name: environmentTags # tag as defined on the machine in the environment where testing will be executed
+  type: string
+- name: containerName # name of the docker container which will be run
+  type: string
+- name: imageName # name of the image to pull from DockerHub
+  type: string
+- name: imageTag # tag of the image to pull from DockerHub
+  type: string
+- name: applicationPort # port on the machine where application will run
+  type: number
+- name: dockerPort # this port of the application inside docker will be mapped to applicationPort
+  type: number
+- name: dockerHubServiceConn
+  type: string
+
+stages:  
+  - stage: DeployProd
+    jobs:
+    - deployment: DeployProduction
+      environment:
+        name: ${{ parameters.environmentName }}
+        tags: ${{ parameters.environmentTags }}
+        resourceType: VirtualMachine
+      workspace:
+        clean: all
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - download: none # we do not need any artifacts
+            - task: Docker@2
+              displayName: Docker Login
+              inputs:
+                containerRegistry: ${{ parameters.dockerHubServiceConn }}
+                command: 'login'
+
+            - task: Bash@3
+              displayName: Run
+              inputs:
+                targetType: 'inline'
+                script: |
+                    docker container stop ${{ parameters.containerName }}
+                    docker container rm ${{ parameters.containerName }}
+                    docker image rm ${{ parameters.imageName }}
+                    docker run -d --name ${{ parameters.containerName }} -p ${{ parameters.applicationPort }}:${{ parameters.dockerPort }} ${{ parameters.imageName }}:${{ parameters.imageTag }}
+                    
+            - task: Docker@2
+              displayName: Docker Logout
+              inputs:
+                containerRegistry: ${{ parameters.dockerHubServiceConn }}
+                command: 'logout'

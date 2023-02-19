@@ -1,0 +1,64 @@
+trigger: none
+
+variables:
+  imageName: ab7580/webgoat
+  imageTag: latest
+  containerName: WebGoatContainer
+  applicationPort: 8080
+  dockerPort: 8080
+  environmentTags: Ubuntu
+  dockerHubServiceConn: DockerHubServiceConn
+  gitLeaksBreak: false
+  dependencyCheckCache: true
+  dependencyCheckBreak: true
+  sonarQubeRun: false
+  sonarQubeBreak: false
+  dockerfilePath: 'webgoat-server/Dockerfile'
+  relativeUrlToScan: WebGoat
+  shouldZAPBreakPipeline: true
+
+stages:
+  - stage: StaticCheckAndBuild
+    jobs:
+    - job: StaticCheckAndBuild
+      pool:
+        vmImage: 'ubuntu-latest'
+      displayName: PureBuild
+      workspace:
+        clean: all
+      steps:
+      
+      - template: 'templates/static_build_lessjobs.yaml'
+        parameters:
+          imageName: ${{ variables.imageName }}
+          imageTag: ${{ variables.imageTag }}
+          dockerHubServiceConn: ${{ variables.dockerHubServiceConn }}
+          mavenPomFile: 'pom.xml'
+          sonarQubeRun: ${{ variables.sonarQubeRun }}
+          sonarQubeBreak: ${{ variables.sonarQubeBreak }}
+          dockerfilePath: ${{ variables.dockerfilePath }}
+
+  - template: 'templates/zap.yaml'
+    parameters:
+      environmentName: test
+      environmentTags: ${{ variables.environmentTags }}
+      dockerHubServiceConn: ${{ variables.dockerHubServiceConn }}
+      containerName: ${{ variables.containerName }}
+      imageName: ${{ variables.imageName }}
+      imageTag: ${{ variables.imageTag }}
+      applicationPort: ${{ variables.applicationPort }}
+      dockerPort: ${{ variables.dockerPort }}
+      relativeUrlToScan: ${{ variables.relativeUrlToScan }}
+      shouldZAPBreakPipeline: ${{ variables.shouldZAPBreakPipeline }}
+
+  - ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/master') }}:
+    - template: 'templates/deploy.yaml'
+      parameters:
+        environmentName: prod
+        environmentTags: ${{ variables.environmentTags }}
+        containerName: ${{ variables.containerName }}
+        imageName: ${{ variables.imageName }}
+        imageTag: ${{ variables.imageTag }}
+        dockerHubServiceConn: ${{ variables.DockerHubServiceConn }}
+        applicationPort: ${{ variables.applicationPort }}
+        dockerPort: ${{ variables.dockerPort }}

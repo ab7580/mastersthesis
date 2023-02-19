@@ -1,0 +1,258 @@
+trigger: none 
+
+variables:
+  imageName: 'ab7580/webgoat'
+  # imageTag: $(Build.BuildId)
+  imageTag: latest
+  containerName: WebGoatContainer
+
+stages:
+  - stage: Build
+    jobs:
+    - job: Build
+      pool:
+        vmImage: 'ubuntu-latest'
+      displayName: Build WebGoat
+      workspace:
+        clean: all
+      steps:
+      - task: SonarQubePrepare@5
+        displayName: SonarQube Prepare
+        inputs:
+          SonarQube: 'SonarCubeServiceConn'
+          scannerMode: 'Other'
+      - task: Maven@3
+        displayName: Maven Build
+        inputs:
+          mavenPomFile: 'pom.xml'
+          goals: 'clean install'
+          publishJUnitResults: false
+          javaHomeOption: 'JDKVersion'
+          jdkVersionOption: '1.11'
+          mavenVersionOption: 'Default'
+          mavenAuthenticateFeed: false
+          effectivePomSkip: false
+          sonarQubeRunAnalysis: true
+          sqMavenPluginVersionChoice: 'latest'
+      - task: SonarQubePublish@5
+        displayName: SonarQube Publish
+        inputs:
+          pollingTimeoutSec: '300'
+      - task: sonar-buildbreaker@8
+        displayName: SonarQube Break (on Fail)
+        inputs:
+          SonarQube: 'SonarCubeServiceConn'
+      - task: PowerShell@2
+        displayName: SonarQube Break (on Pipeline Configuration)
+        inputs:
+          filePath: 'devops/sonarcube_fail_pipeline.ps1'
+        env:
+          SONAR-TOKEN: $(sonar-token) # secret defined in pipeline must be mapped to env variable and used in powershell script
+      - task: Docker@2
+        displayName: Build Docker Image
+        inputs:
+          repository: '$(imageName)'
+          command: 'build'
+          Dockerfile: 'webgoat-server/Dockerfile'
+          tags: '$(imageTag)'
+      - task: Docker@2
+        displayName: Push Docker Image
+        inputs:
+          containerRegistry: 'DockerHubServiceConn'
+          repository: '$(imageName)'
+          command: 'push'
+          tags: '$(imageTag)'
+      
+  - stage: DeployTest
+    jobs:
+    - deployment: DynamicTesting
+      environment:
+        name: test
+        tags: Ubuntu
+        resourceType: VirtualMachine
+      workspace:
+        clean: all
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - task: Docker@2
+              displayName: Docker Login
+              inputs:
+                containerRegistry: 'DockerHubServiceConn'
+                command: 'login'
+            - task: Bash@3
+              displayName: Run WebGoat for ZAP Testing
+              inputs:
+                targetType: 'inline'
+                script: |
+                  # docker network is needed for ZAP container to access app container
+                  docker network create zapnet
+                  docker container stop $(containerName)
+                  docker container rm $(containerName)
+                  docker image rm $(imageName)
+                  docker run --net zapnet -d --name $(containerName) -p 8080:8080 $(imageName):$(imageTag)
+            - task: Docker@2
+              displayName: Docker Logout
+              inputs:
+                containerRegistry: 'DockerHubServiceConn'
+                command: 'logout'
+            - task: Bash@3
+              displayName: ZAP Full Scan
+              inputs:
+                targetType: 'inline'
+                script: |
+                  for i in {1..10} 
+                  do 
+                    # first we must acquire the IP for WebGoat running inside zapnet docker network
+                  	zapIp=$(docker inspect $(containerName) | jq -r ".[0].NetworkSettings.Networks.zapnet.IPAddress")
+                  	[[ $zapIp == *"."* ]] && break || sleep 1 # if we have . in string -> we got IP
+                  done
+                  sleep 5 # we wait for webgoat app to start or else zap scan will fail. this is enough time.
+                  docker run --net zapnet \
+                    -v $(Pipeline.Workspace):/zap/wrk/:rw \
+                    -t owasp/zap2docker-stable zap-full-scan.py -d -I -j -m 10 -T 60 -t http://"$zapIp":8080/WebGoat \
+                    -J report.json -r report.html
+            - task: Bash@3
+              displayName: ZAP Break (on Pipeline Configuration)
+              inputs:
+                targetType: 'inline'
+                script: |
+                  lvl1Risks=0
+                  lvl2Risks=0
+                  lvl3Risks=0
+                  lvl4Risks=0
+                  for row in $(jq '.site[] | select(.alerts | length > 0) | .alerts[]' $(Pipeline.Workspace)/report.json | jq -r .riskcode); do
+                  	case $row in
+                  		0)
+                  			;;
+                  		1)
+                  			((lvl1Risks++))
+                  			;;
+                  		2)
+                  			((lvl2Risks++))
+                  			;;
+                  		3)
+                  			((lvl3Risks++))
+                  			;;
+                  		4)
+                  			((lvl4Risks++))
+                  			;;
+                  		*)
+                  			echo "ERROR IN SCRIPT - UNEXPECTED VALUE"
+                  			echo $row
+                  			;;
+                  	esac
+                  done
+                  if ((lvl1Risks > $(MAX-LVL1-RISK-ALLOWED))); then
+                      echo "Exceeded maximum allowed level 1 risk from ZAP report"
+                      exit 1
+                  fi
+                  if ((lvl2Risks > $(MAX-LVL2-RISK-ALLOWED))); then
+                      echo "Exceeded maximum allowed level 2 risk from ZAP report"
+                      exit 1
+                  fi
+                  if ((lvl3Risks > $(MAX-LVL3-RISK-ALLOWED))); then
+                      echo "Exceeded maximum allowed level 3 risk from ZAP report"
+                      exit 1
+                  fi
+                  if ((lvl4Risks > $(MAX-LVL4-RISK-ALLOWED))); then
+                      echo "Exceeded maximum allowed level 4 risk from ZAP report"
+                      exit 1
+                  fi
+                  echo "PASSED"
+            - task: CopyFiles@2
+              displayName: Copy ZAP Results
+              condition: always()
+              inputs:
+                SourceFolder: '$(Pipeline.Workspace)'
+                TargetFolder: '$(Build.ArtifactStagingDirectory)'
+            - task: PublishBuildArtifacts@1
+              displayName: Publish ZAP Results
+              condition: always()
+              inputs:
+                ArtifactName: 'owasp_zap_reports'    
+            - bash: |
+                cat <<EOF > $(Pipeline.Workspace)/nunit-template.hbs
+
+                <test-run
+                    id="2"
+                    name="Owasp test"
+                    start-time="{{@generated}}">
+                    {{#each site}}<test-suite
+                        id="{{@index}}"
+                        type="Assembly"
+                        name="{{[@name]}}"
+                        result="Failed"
+                        failed="{{alerts.length}}">
+                        <attachments>
+                            <attachment>
+                                <filePath>$(Pipeline.Workspace)/report.html</filePath>
+                            </attachment>
+                        </attachments>
+                        {{#each alerts}}<test-case
+                            id="{{@index}}"
+                            name="{{alert}}"
+                            result="Failed"
+                            fullname="{{alert}}"
+                            time="1">
+                            <failure>
+                                <message>
+                                    <![CDATA[{{{desc}}}]]>
+                                </message>
+                                <stack-trace>
+                                    <![CDATA[
+                Solution:
+                {{{solution}}}
+
+                Reference:
+                {{{reference}}}
+
+                instances:{{#each instances}}
+                * {{uri}}
+                    - {{method}}
+                    {{#if evidence}}- {{{evidence}}}{{/if}}
+                                    {{/each}}]]>
+                                </stack-trace>
+                            </failure>
+                        </test-case>
+                        {{/each}}
+                    </test-suite>
+                    {{/each}}
+                </test-run>
+                EOF
+              displayName: 'Create NUnit Template'
+              condition: always()
+              
+            - bash: 'handlebars $(Pipeline.Workspace)/report.json < $(Pipeline.Workspace)/nunit-template.hbs > $(Pipeline.Workspace)/test-results.xml'
+              displayName: 'Generate NUnit results'
+              condition: always()
+            - task: PublishTestResults@2
+              displayName: 'Publish NUnit Test Results'
+              inputs:
+                testResultsFormat: NUnit
+                testResultsFiles: '$(Pipeline.Workspace)/test-results.xml'
+              condition: always()
+
+  - stage: DeployProd
+    jobs:
+    - deployment: DeployProduction
+      environment:
+        name: prod
+        tags: Ubuntu
+        resourceType: VirtualMachine
+      workspace:
+        clean: all
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - task: Bash@3
+              displayName: Run WebGoat
+              inputs:
+                targetType: 'inline'
+                script: |
+                  docker container stop $(containerName)
+                  docker container rm $(containerName)
+                  docker image rm $(imageName)
+                  docker run -d --name $(containerName) -p 8080:8080 $(imageName):$(imageTag)

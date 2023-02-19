@@ -1,0 +1,7 @@
+trigger: none 
+
+stages:
+  - template: 'templates/dependency_check.yaml'
+    parameters:
+      dependencyCheckCache: true
+      dependencyCheckBreak: true
